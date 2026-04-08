@@ -1,0 +1,44 @@
+# UspeshCLAW Plugins
+
+Набор кастомных плагинов для [Paperclip](https://github.com/paperclipai/paperclip) + deploy-конфиги для развёртывания мультиагентной AI-платформы на VPS.
+
+## Содержимое
+
+```
+UspeshCLAW-plugins/
+├── plugins/                    # 4 плагина Paperclip
+│   ├── sitechist-devices/      # Аккаунты, прокси, OAuth, Telegram-боты, sync с OpenClaw
+│   ├── sitechist-cloudflare/   # Управление субдоменами через Cloudflare API
+│   ├── sitechist-reports/      # Генерация отчётов
+│   └── sitechist-smm/          # SMM: VK/Telegram/Telegraph publish, Imagen 4 covers
+├── deploy/                     # Deploy-конфиги для prod
+│   ├── docker-compose.yml      # Paperclip + Postgres
+│   ├── cover-overlay-module.js # ImageMagick overlay для SMM-обложек
+│   └── cover-overlay-endpoint.js
+├── agent-instructions/         # Примеры JSON-инструкций для агентов (шаблоны)
+└── HANDOFF-CLONE-INSTRUCTIONS.md   # Полный гайд развёртывания
+```
+
+## Быстрый старт
+
+Открой [HANDOFF-CLONE-INSTRUCTIONS.md](HANDOFF-CLONE-INSTRUCTIONS.md) в Claude Code, заполни переменные (имя проекта, домен, токены) и скажи Claude действовать пошагово. Гайд ведёт от чистого VPS Ubuntu до работающей платформы с 4 плагинами и 11 AI-агентами в Telegram.
+
+## Что понадобится
+
+- VPS: Ubuntu 22.04+/Debian 12, 2+ vCPU, 4+ GB RAM
+- Домен (с управлением через Cloudflare)
+- 11 Telegram-ботов (опционально — можно меньше)
+- Хотя бы один AI-ключ: ChatGPT Plus OAuth / Anthropic API / OpenRouter
+- Gemini API key для Imagen 4 (обложки SMM)
+
+## Upstream
+
+Плагины работают поверх [paperclipai/paperclip](https://github.com/paperclipai/paperclip) (open source). Этот репо содержит **только** дельту: 4 кастомных плагина + deploy-скрипты + инструкция.
+
+## Наименование плагинов
+
+Папки плагинов называются `sitechist-*` — это историческое имя владельца. При деплое гайд автоматически переименует пакеты `@sitechist/plugin-*` → `@${PROJECT_NAME}/plugin-*` через `sed`. Сами папки остаются с префиксом `sitechist-` для совпадения с production-версией на сервере владельца.
+
+## Лицензия
+
+Исходники Paperclip — по лицензии upstream. Кастомные плагины в этом репо — MIT (если не указано иное в `package.json` конкретного плагина).
