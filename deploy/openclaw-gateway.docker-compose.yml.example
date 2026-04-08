@@ -1,0 +1,120 @@
+# OpenClaw Gateway — docker-compose template
+#
+# OpenClaw is a MIT-licensed open-source personal AI assistant runtime:
+#   https://github.com/openclaw/openclaw
+#   https://docs.openclaw.ai
+#
+# This file is a template for running 11 agents with Telegram channels.
+# Copy to docker-compose.yml, fill .env, then: docker compose up -d
+#
+# Services:
+#   - gateway  — main runtime (11 agents, Telegram webhooks)
+#   - cli      — interactive CLI sharing the gateway network (profiles: cli)
+#   - studio   — web UI for agent management (optional)
+#
+# Data layout (mounted from host):
+#   ./data/openclaw/           → /home/node/.openclaw
+#     ├── openclaw.json         — main config (agents list, model defaults)
+#     ├── workspaces/<agent>/   — per-agent memory, SOUL.md, learnings
+#     └── agents/<agent>/       — per-agent auth-profiles, channels config
+#   ./proxy-router/proxychains.conf → /etc/proxychains4.conf (optional)
+#   ./tools/                   → /home/node/tools (host admin scripts, read-only)
+#
+# First-run setup: use `openclaw onboard` CLI inside the gateway container,
+# or follow https://docs.openclaw.ai/start/getting-started
+
+services:
+  gateway:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: ${PROJECT_NAME:-openclaw}-gateway
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18789:18789"
+    volumes:
+      - ./data/openclaw:/home/node/.openclaw
+      - ./proxy-router/proxychains.conf:/etc/proxychains4.conf:ro
+      - ./tools:/home/node/tools:ro
+    environment:
+      OPENCLAW_GATEWAY_BIND: "lan"
+      OPENCLAW_NO_RESPAWN: "1"
+      OPENCLAW_LOG_LEVEL: "${OPENCLAW_LOG_LEVEL:-info}"
+      OPENCLAW_SANDBOX: "${OPENCLAW_SANDBOX:-0}"
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN}"
+
+      # AI providers (use only what you need)
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      EXA_API_KEY: "${EXA_API_KEY:-}"
+
+      # Telegram bot tokens (one per agent; leave empty to disable that agent's TG channel)
+      TELEGRAM_BOT_TOKEN:             "${TELEGRAM_MAIN_BOT_TOKEN:-}"
+      TELEGRAM_CONCIERGE_BOT_TOKEN:   "${TELEGRAM_CONCIERGE_BOT_TOKEN:-}"
+      TELEGRAM_HUNTER_BOT_TOKEN:      "${TELEGRAM_HUNTER_BOT_TOKEN:-}"
+      TELEGRAM_CLOSER_BOT_TOKEN:      "${TELEGRAM_CLOSER_BOT_TOKEN:-}"
+      TELEGRAM_CRM_BOT_TOKEN:         "${TELEGRAM_CRM_BOT_TOKEN:-}"
+      TELEGRAM_CRITIC_BOT_TOKEN:      "${TELEGRAM_CRITIC_BOT_TOKEN:-}"
+      TELEGRAM_DEVELOPER_BOT_TOKEN:   "${TELEGRAM_DEVELOPER_BOT_TOKEN:-}"
+      TELEGRAM_DESIGNER_BOT_TOKEN:    "${TELEGRAM_DESIGNER_BOT_TOKEN:-}"
+      TELEGRAM_SMM_BOT_TOKEN:         "${TELEGRAM_SMM_BOT_TOKEN:-}"
+      TELEGRAM_ANALYTICS_BOT_TOKEN:   "${TELEGRAM_ANALYTICS_BOT_TOKEN:-}"
+      TELEGRAM_ORCHESTRATOR_BOT_TOKEN:"${TELEGRAM_ORCHESTRATOR_BOT_TOKEN:-}"
+      TELEGRAM_GROUP_CHAT_ID:         "${TELEGRAM_GROUP_CHAT_ID:-}"
+
+      # Outbound proxy (optional — only if you need to route LLM calls through proxy)
+      HTTP_PROXY:  "${OUTBOUND_PROXY_URL:-}"
+      HTTPS_PROXY: "${OUTBOUND_PROXY_URL:-}"
+      ALL_PROXY:   "${OUTBOUND_PROXY_URL:-}"
+      NO_PROXY:    "localhost,127.0.0.1,172.17.0.1,host.docker.internal"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:18789/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # Interactive CLI — shares network namespace with gateway
+  # Start with: docker compose --profile cli run --rm cli
+  cli:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: ${PROJECT_NAME:-openclaw}-cli
+    network_mode: "service:gateway"
+    volumes:
+      - ./data/openclaw:/home/node/.openclaw
+      - ./proxy-router/proxychains.conf:/etc/proxychains4.conf:ro
+      - ./tools:/home/node/tools:ro
+    profiles: ["cli"]
+    stdin_open: true
+    tty: true
+    entrypoint: ["bash"]
+    environment:
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      EXA_API_KEY: "${EXA_API_KEY:-}"
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN}"
+      HTTP_PROXY:  "${OUTBOUND_PROXY_URL:-}"
+      HTTPS_PROXY: "${OUTBOUND_PROXY_URL:-}"
+      ALL_PROXY:   "${OUTBOUND_PROXY_URL:-}"
+      NO_PROXY:    "localhost,127.0.0.1,172.17.0.1,host.docker.internal"
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  # OpenClaw Studio (web UI for agent management) — optional
+  # Studio sources must be placed at /var/www/openclaw-studio on the host
+  # (or adjust the volume mount below).
+  studio:
+    image: node:22-slim
+    container_name: ${PROJECT_NAME:-openclaw}-studio
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ${STUDIO_SOURCE_DIR:-/var/www/openclaw-studio}:/app
+    ports:
+      - "127.0.0.1:3100:3100"
+    environment:
+      PORT: "3100"
+      HOST: "0.0.0.0"
+      STUDIO_ACCESS_TOKEN: "${STUDIO_ACCESS_TOKEN}"
+      OPENCLAW_UPSTREAM_URL: "ws://gateway:18789"
+    command: ["node", "server/index.js"]
+    depends_on:
+      gateway:
+        condition: service_healthy

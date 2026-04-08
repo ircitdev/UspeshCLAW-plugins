@@ -12,8 +12,10 @@ UspeshCLAW-plugins/
 │   ├── sitechist-reports/      # Генерация отчётов
 │   └── sitechist-smm/          # SMM: VK/Telegram/Telegraph publish, Imagen 4 covers
 ├── deploy/                     # Deploy-конфиги для prod
-│   ├── docker-compose.yml      # Paperclip + Postgres
-│   ├── cover-overlay-module.js # ImageMagick overlay для SMM-обложек (paperclip-deploy вариант)
+│   ├── docker-compose.yml                              # Paperclip + Postgres
+│   ├── openclaw-gateway.docker-compose.yml.example     # OpenClaw Gateway (gateway + cli + studio)
+│   ├── openclaw-gateway.env.example                    # env-шаблон для gateway
+│   ├── cover-overlay-module.js                         # ImageMagick overlay для SMM-обложек
 │   └── cover-overlay-endpoint.js
 ├── tools/                      # Admin REST API (санитайзенные шаблоны)
 │   ├── admin-api.js.example    # Node.js http-сервер: агенты, OAuth, publish, cover-overlay
@@ -36,9 +38,16 @@ UspeshCLAW-plugins/
 - Хотя бы один AI-ключ: ChatGPT Plus OAuth / Anthropic API / OpenRouter
 - Gemini API key для Imagen 4 (обложки SMM)
 
-## Upstream
+## Upstream компоненты (всё публичный opensource)
 
-Плагины работают поверх [paperclipai/paperclip](https://github.com/paperclipai/paperclip) (open source). Этот репо содержит **только** дельту: 4 кастомных плагина + deploy-скрипты + инструкция.
+Этот репо содержит **только дельту** — 4 кастомных плагина, admin-api, deploy-конфиги и инструкцию. Базовые рантаймы берутся у upstream:
+
+| Компонент | Репо | Образ / инсталл |
+|---|---|---|
+| Paperclip (админка плагинов) | [paperclipai/paperclip](https://github.com/paperclipai/paperclip) | Собирается локально из исходников |
+| OpenClaw Gateway (рантайм агентов) | [openclaw/openclaw](https://github.com/openclaw/openclaw) · [docs.openclaw.ai](https://docs.openclaw.ai) | `docker pull ghcr.io/openclaw/openclaw:latest` |
+
+Оба под MIT-совместимыми лицензиями. Никаких закрытых компонентов — друг может развернуть всё без доступа к чьему-либо приватному репо.
 
 ## Наименование плагинов
 

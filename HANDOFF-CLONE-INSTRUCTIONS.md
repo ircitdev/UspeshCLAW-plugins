@@ -424,18 +424,101 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18791/api/status
 
 ### Часть G. OpenClaw Gateway (11 агентов)
 
-> **Claude:** OpenClaw — это закрытый компонент владельца (не публичный opensource). Если исходников нет в архиве — уточни у владельца доступ. Альтернативно можно запустить платформу БЕЗ OpenClaw: 4 плагина и admin-api будут работать, но 11 агентов с Telegram-фронтом не будут оркестрироваться.
+**OpenClaw** — это open-source (MIT) personal AI assistant runtime. Живёт по адресам:
+- Код: [github.com/openclaw/openclaw](https://github.com/openclaw/openclaw)
+- Документация: [docs.openclaw.ai](https://docs.openclaw.ai)
+- Docker образ: `ghcr.io/openclaw/openclaw:latest` (публичный, GHCR)
+- Discord: [discord.gg/clawd](https://discord.gg/clawd)
 
-Если доступ есть:
+Запускается как обычный Docker-контейнер, `docker pull` не требует авторизации. Поверх этого образа развёрнуты 11 кастомных агентов через конфиг `data/openclaw/openclaw.json`.
+
+#### G.1. Подготовка структуры
 
 ```bash
+mkdir -p /opt/${PROJECT_NAME}/{data/openclaw,proxy-router,tools}
 cd /opt/${PROJECT_NAME}
-# docker-compose.yml для gateway с переменными окружения на 11 ботов
-docker compose up -d
-docker compose logs gateway --tail=50
+
+# Копируем санитайзенный compose из клонированного репо
+cp /tmp/UspeshCLAW-plugins/deploy/openclaw-gateway.docker-compose.yml.example docker-compose.yml
+cp /tmp/UspeshCLAW-plugins/deploy/openclaw-gateway.env.example                 .env
 ```
 
-Для каждого из 11 агентов настрой Telegram-бот-токен через UI Paperclip: **Plugins → devices → Agents → Add bot**.
+Заполни `.env`:
+
+```bash
+# Генерируем два случайных токена
+sed -i "s|CHANGE_ME_openssl_rand_hex_32|$(openssl rand -hex 32)|" .env   # сначала OPENCLAW_GATEWAY_TOKEN
+# Второй заменишь вручную — STUDIO_ACCESS_TOKEN
+
+# PROJECT_NAME, Telegram токены из своего блока переменных
+vi .env
+```
+
+Если прокси **не нужен** — оставь `OUTBOUND_PROXY_URL=` пустым. Если нужен (например, LLM API-ключи не работают из твоей страны напрямую), заполни формата `socks5://user:pass@host:port`.
+
+#### G.2. Первый запуск и onboarding
+
+```bash
+# Качаем образ (публичный, авторизация не нужна)
+docker pull ghcr.io/openclaw/openclaw:latest
+
+# Запускаем только gateway (studio пока не нужен)
+docker compose up -d gateway
+docker compose logs gateway -f   # ждём "gateway listening on :18789"
+```
+
+OpenClaw при первом запуске создаёт пустую `data/openclaw/` структуру. Для настройки 11 агентов два варианта:
+
+**Вариант А — через CLI onboard (рекомендуется документацией OpenClaw):**
+```bash
+docker compose --profile cli run --rm cli
+# внутри контейнера:
+openclaw onboard
+# мастер проведёт через настройку workspace, агентов, каналов, skills
+# см. https://docs.openclaw.ai/start/getting-started
+```
+
+**Вариант Б — вручную через `openclaw.json`:**
+Создай `data/openclaw/openclaw.json` с 11 агентами:
+```json
+{
+  "agents": {
+    "defaults": { "model": { "provider": "openrouter", "name": "anthropic/claude-sonnet-4-6" } },
+    "list": [
+      { "id": "main",         "name": "Main",         "identity": { "emoji": "🏠" }, "channels": { "telegram": { "botTokenEnv": "TELEGRAM_MAIN_BOT_TOKEN" } } },
+      { "id": "orchestrator", "name": "Orchestrator", "identity": { "emoji": "🎯" }, "channels": { "telegram": { "botTokenEnv": "TELEGRAM_ORCHESTRATOR_BOT_TOKEN" } } },
+      { "id": "concierge",    "name": "Concierge",    "identity": { "emoji": "💬" }, "channels": { "telegram": { "botTokenEnv": "TELEGRAM_CONCIERGE_BOT_TOKEN" } } }
+      // ... остальные 8 агентов аналогично
+    ]
+  }
+}
+```
+Формат конфига см. в `openclaw.json` на VPS владельца или в [docs.openclaw.ai](https://docs.openclaw.ai).
+
+После правки конфига: `docker compose restart gateway`.
+
+#### G.3. Проверка
+
+```bash
+# Health
+curl http://127.0.0.1:18789/healthz
+
+# Список агентов через admin-api (Часть F)
+TOKEN=$(grep ADMIN_API_TOKEN /opt/${PROJECT_NAME}/tools/.env | cut -d= -f2)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18791/api/openclaw/agents
+```
+
+В Telegram отправь `/start` каждому боту — если токен правильный, агент ответит согласно своему SOUL.md.
+
+#### G.4. OpenClaw Studio (опционально)
+
+`studio` — это веб-UI для управления агентами (альтернатива Paperclip UI). Его исходник НЕ входит в образ gateway — он живёт в отдельной папке на хосте (`/var/www/openclaw-studio`) и монтируется как volume. Если не нужно — закомментируй сервис `studio` в `docker-compose.yml`.
+
+Если нужно — запроси у владельца архив `/var/www/openclaw-studio/` или ищи отдельный репо `openclaw/studio` на GitHub (на момент написания гайда официального репо может не быть).
+
+#### G.5. Привязка админки Paperclip к агентам
+
+Для каждого из 11 агентов настрой Telegram-бот-токен и модель через UI Paperclip: **Plugins → devices → Agents → Add bot**. Либо отредактируй `openclaw.json` напрямую и сделай `docker compose restart gateway`.
 
 ### Часть H. Caddy
 
@@ -568,8 +651,7 @@ curl "https://api.telegram.org/bot$TG_MAIN_TOKEN/getMe"
 
 Эти части требуют ручной настройки или доступа владельца:
 
-- **OpenClaw Gateway исходники** — закрытый компонент, нужен отдельный доступ от владельца
-- **admin-api.js** — кастомный скрипт, запроси у владельца или напиши минимальную версию
+- **OpenClaw Studio исходники** — веб-UI для управления агентами, монтируется из `/var/www/openclaw-studio` на хосте. Не входит в образ gateway. Если не нужен — закомментируй сервис `studio` в compose. OpenClaw Gateway сам по себе **публичный opensource**, см. Часть G
 - **OAuth-сессии ChatGPT Plus** — привязаны к конкретным аккаунтам, нужна повторная авторизация на новом VPS
 - **Исторические данные Paperclip БД** — не копируем, стартуем с чистой БД
 - **Прокси для аккаунтов** — нужны отдельные прокси-сервера (настраивается в `devices` плагине)
@@ -583,7 +665,7 @@ curl "https://api.telegram.org/bot$TG_MAIN_TOKEN/getMe"
 
 1. `docker compose up -d` возвращает ошибку билда → показать лог, не фиксить наугад
 2. Caddy не получает сертификат Let's Encrypt → проверить DNS propagation, не хакать configs
-3. Отсутствуют исходники OpenClaw Gateway или admin-api.js → спросить владельца, где взять
+3. `docker pull ghcr.io/openclaw/openclaw:latest` падает → проверить доступ к ghcr.io, не хакать прокси
 4. Переменные `$BETTER_AUTH_SECRET` или `$CF_API_TOKEN` пустые → не генерировать заглушки
 5. Нужно удалить существующие файлы на VPS (`rm -rf`) → подтвердить у пользователя
 6. Нужно `docker compose down -v` (стирает volumes) → подтвердить у пользователя
