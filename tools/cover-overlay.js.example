@@ -1,0 +1,143 @@
+// cover-overlay.js — ImageMagick cover overlay + optional GCS upload
+//
+// Used by admin-api.js for the /api/cover/overlay endpoint.
+// Takes a base64 image + title + branding options, overlays text and logo
+// using ImageMagick, optionally uploads result to Google Cloud Storage,
+// and returns a public URL + base64 of the final image.
+//
+// Requirements on host:
+//   - ImageMagick (`convert` CLI) + DejaVu-Sans-Bold font
+//   - gsutil CLI (optional, only if GCS_BUCKET is set)
+//   - Node 18+ (for native global fetch)
+//
+// Configuration via environment:
+//   GCS_BUCKET        — target bucket (leave empty to skip upload)
+//   GCS_PREFIX        — prefix inside bucket (default: "covers")
+//   GCS_PUBLIC_BASE   — public URL base (default: https://storage.googleapis.com/${GCS_BUCKET})
+//
+// IMPORTANT: This file is a TEMPLATE. Rename to cover-overlay.js and adapt.
+
+const fs = require("fs");
+const crypto = require("crypto");
+const { execSync } = require("child_process");
+
+const GCS_BUCKET      = process.env.GCS_BUCKET      || "";
+const GCS_PREFIX      = process.env.GCS_PREFIX      || "covers";
+const GCS_PUBLIC_BASE = process.env.GCS_PUBLIC_BASE || (GCS_BUCKET ? `https://storage.googleapis.com/${GCS_BUCKET}` : "");
+
+const GRAVITY = {
+  "top-left": "NorthWest", "top-center": "North", "top-right": "NorthEast",
+  "center": "Center",
+  "bottom-left": "SouthWest", "bottom-center": "South", "bottom-right": "SouthEast",
+};
+
+// Escape a string for use as ImageMagick -annotate argument
+function safeIM(s) {
+  return String(s)
+    .replace(/\\/g, "\\\\")
+    .replace(/%/g, "%%")
+    .replace(/\n/g, " ")
+    .replace(/\r/g, "");
+}
+
+// Wrap arg in single quotes for shell, escaping internal single quotes
+function shQ(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+module.exports = async function handleCoverOverlay(req, res, readBody, json) {
+  let inputPath, outputPath, logoPath;
+  try {
+    const body = JSON.parse(await readBody(req));
+    if (!body.imageBase64 || !body.title) {
+      return json(res, { ok: false, error: "imageBase64 and title required" }, 400);
+    }
+    const b = body.branding || {};
+    const tmpDir = "/tmp/covers";
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+    const id = crypto.randomBytes(8).toString("hex");
+    inputPath  = `${tmpDir}/${id}-input.png`;
+    outputPath = `${tmpDir}/${id}-output.png`;
+    logoPath   = `${tmpDir}/${id}-logo.png`;
+
+    fs.writeFileSync(inputPath, Buffer.from(body.imageBase64, "base64"));
+
+    const tg = GRAVITY[b.titlePosition || "bottom-left"] || "SouthWest";
+    const tc = "#" + (b.titleColor || "FFFFFF").replace(/#/g, "");
+    const ts = String(parseInt(b.titleSize) || 48);
+    const title = safeIM(body.title);
+
+    const args = ["convert", inputPath];
+
+    // Shadow pass
+    if (b.titleShadow !== false) {
+      args.push(
+        "-gravity", tg, "-fill", "rgba(0,0,0,0.6)",
+        "-font", "DejaVu-Sans-Bold", "-pointsize", ts,
+        "-annotate", "+42+42", title,
+      );
+    }
+    // Title text
+    args.push(
+      "-gravity", tg, "-fill", tc,
+      "-font", "DejaVu-Sans-Bold", "-pointsize", ts,
+      "-annotate", "+40+40", title,
+    );
+
+    // Link text (e.g. "@mychannel")
+    if (b.linkText) {
+      const lg = GRAVITY[b.linkPosition || "bottom-right"] || "SouthEast";
+      const lc = "#" + (b.linkColor || "93c5fd").replace(/#/g, "");
+      args.push(
+        "-gravity", lg, "-fill", lc,
+        "-font", "DejaVu-Sans", "-pointsize", "24",
+        "-annotate", "+20+20", safeIM(b.linkText),
+      );
+    }
+    args.push(outputPath);
+
+    execSync(args.map(shQ).join(" "), { timeout: 15000 });
+
+    // Logo composite
+    if (b.logoDark) {
+      try {
+        const lr = await fetch(b.logoDark);
+        if (lr.ok) {
+          fs.writeFileSync(logoPath, Buffer.from(await lr.arrayBuffer()));
+          const logoG = GRAVITY[b.logoPosition || "top-right"] || "NorthEast";
+          const logoSz = String(parseInt(b.logoSize) || 110);
+          execSync(
+            `convert ${shQ(outputPath)} \\( ${shQ(logoPath)} -resize ${logoSz}x${logoSz} \\) ` +
+            `-gravity ${logoG} -geometry +20+20 -composite ${shQ(outputPath)}`,
+            { timeout: 10000 },
+          );
+        }
+      } catch (le) { console.error("logo overlay:", le.message); }
+      try { fs.unlinkSync(logoPath); } catch {}
+    }
+
+    const buf = fs.readFileSync(outputPath);
+    const b64 = buf.toString("base64");
+
+    // Upload to GCS (only if configured)
+    let url = "";
+    if (GCS_BUCKET && GCS_PUBLIC_BASE) {
+      try {
+        const gcsRelPath = `${GCS_PREFIX}/${body.projectId || "default"}/${id}.png`;
+        const gcsTmp = `/tmp/${id}_gcs.png`;
+        fs.writeFileSync(gcsTmp, buf);
+        execSync(`gsutil cp ${shQ(gcsTmp)} ${shQ(`gs://${GCS_BUCKET}/${gcsRelPath}`)}`, { timeout: 20000 });
+        execSync(`gsutil acl ch -u AllUsers:R ${shQ(`gs://${GCS_BUCKET}/${gcsRelPath}`)}`, { timeout: 10000 });
+        url = `${GCS_PUBLIC_BASE}/${gcsRelPath}`;
+        try { fs.unlinkSync(gcsTmp); } catch {}
+      } catch (ge) { console.error("GCS upload:", ge.message); }
+    }
+
+    [inputPath, outputPath].forEach(f => { try { if (f) fs.unlinkSync(f); } catch {} });
+    json(res, { ok: true, url, base64: b64 });
+
+  } catch (e) {
+    [inputPath, outputPath, logoPath].forEach(f => { try { if (f) fs.unlinkSync(f); } catch {} });
+    json(res, { ok: false, error: e.message }, 500);
+  }
+};

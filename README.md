@@ -4,7 +4,7 @@
 
 ## Содержимое
 
-```
+```text
 UspeshCLAW-plugins/
 ├── plugins/                    # 4 плагина Paperclip
 │   ├── sitechist-devices/      # Аккаунты, прокси, OAuth, Telegram-боты, sync с OpenClaw
@@ -13,8 +13,13 @@ UspeshCLAW-plugins/
 │   └── sitechist-smm/          # SMM: VK/Telegram/Telegraph publish, Imagen 4 covers
 ├── deploy/                     # Deploy-конфиги для prod
 │   ├── docker-compose.yml      # Paperclip + Postgres
-│   ├── cover-overlay-module.js # ImageMagick overlay для SMM-обложек
+│   ├── cover-overlay-module.js # ImageMagick overlay для SMM-обложек (paperclip-deploy вариант)
 │   └── cover-overlay-endpoint.js
+├── tools/                      # Admin REST API (санитайзенные шаблоны)
+│   ├── admin-api.js.example    # Node.js http-сервер: агенты, OAuth, publish, cover-overlay
+│   ├── cover-overlay.js.example# ImageMagick + GCS upload, подключается из admin-api
+│   ├── .env.example            # Все настройки через переменные окружения
+│   └── README.md               # Установка, эндпоинты, PM2 запуск
 ├── agent-instructions/         # Примеры JSON-инструкций для агентов (шаблоны)
 └── HANDOFF-CLONE-INSTRUCTIONS.md   # Полный гайд развёртывания
 ```

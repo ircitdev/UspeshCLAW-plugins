@@ -365,42 +365,62 @@ docker compose restart server
 
 ### Часть F. admin-api (PM2)
 
+admin-api.js — тонкий Node.js REST-сервер (без Express, только native `http`). Он мост между Paperclip UI и системными операциями: управление агентами, OAuth callback, публикация HTML, cover-overlay. Исходник лежит в этом же репо — `tools/admin-api.js.example`.
+
 ```bash
 mkdir -p /opt/${PROJECT_NAME}/tools
 cd /opt/${PROJECT_NAME}/tools
-# cover-overlay-module.js и cover-overlay-endpoint.js уже скопированы в Части A
-npm init -y
-npm install express body-parser node-fetch form-data @google-cloud/storage
+
+# Копируем санитайзенные шаблоны из клонированного репо
+cp /tmp/UspeshCLAW-plugins/tools/admin-api.js.example       admin-api.js
+cp /tmp/UspeshCLAW-plugins/tools/cover-overlay.js.example   cover-overlay.js
+cp /tmp/UspeshCLAW-plugins/tools/.env.example               .env
+
+# dotenv нужен только для того, чтобы PM2 подцепил .env
+npm init -y >/dev/null
+npm install dotenv
 ```
 
-Создай `/opt/${PROJECT_NAME}/tools/.env`:
+Заполни `.env` реальными значениями:
+
+```bash
+# Обязательно: случайный токен для Bearer auth
+sed -i "s|CHANGE_ME_openssl_rand_hex_32|$(openssl rand -hex 32)|" .env
+
+# Адаптируй пути под свою структуру (PROJECT_ROOT, GATEWAY_CONTAINER, DOMAIN)
+vi .env
 ```
-PORT=18791
-PAPERCLIP_CONTAINER=${PROJECT_NAME}-server
-GEMINI_API_KEY=...
-```
 
-> **Claude:** файл `admin-api.js` НЕ входит в публичные исходники — это кастомный скрипт владельца. Запроси его у владельца (или вместе напишите минимальную версию: Express + 5 endpoint'ов из таблицы ниже). Без admin-api часть UI-функций не работает, но Paperclip и плагины сами по себе функциональны.
+Все переменные задокументированы в [tools/README.md](https://github.com/ircitdev/UspeshCLAW-plugins/tree/main/tools). Минимум, что нужно проверить:
 
-Минимальный набор endpoints (можно сгенерировать по описанию):
-
-| Endpoint | Метод | Назначение |
-|----------|-------|-----------|
-| `/api/openclaw/agents` | GET | Список агентов + auth-profiles |
-| `/api/openclaw/agent-config` | POST | Изменить модель/имя/emoji агента |
-| `/api/openclaw/agent-profile-assign` | POST | Назначить профиль конкретному агенту |
-| `/api/auth/callback-forward` | POST | Проброс OAuth callback в Docker |
-| `/api/auth/set-profile` | POST | Записать профиль во ВСЕ агенты |
-| `/api/cover/overlay` | POST | ImageMagick overlay + GCS upload |
+| Переменная | Значение |
+|------------|----------|
+| `ADMIN_API_TOKEN` | Сгенерирован выше, обязателен |
+| `PROJECT_ROOT` | `/opt/${PROJECT_NAME}` |
+| `GATEWAY_CONTAINER` | Имя контейнера OpenClaw (например `myproject-gateway`) |
+| `DOMAIN` | Твой домен (`myproject.com`) |
+| `DEFAULT_AGENT` | ID главного агента (`main` или `orchestrator`) |
+| `GCS_BUCKET` | Оставь пустым если GCS не используешь — будет работать без загрузки обложек в облако |
 
 Запусти через PM2:
+
 ```bash
-pm2 start admin-api.js --name admin-api
+pm2 start admin-api.js --name admin-api --node-args="-r dotenv/config"
 pm2 save
 pm2 startup systemd   # следовать инструкции
 ```
 
-**Проверка:** `curl http://127.0.0.1:18791/api/openclaw/agents`.
+**Проверка:**
+
+```bash
+TOKEN=$(grep ADMIN_API_TOKEN .env | cut -d= -f2)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18791/api/status
+# должно вернуть JSON с gateway/health/pm2/proxyIP
+```
+
+> **Claude:** admin-api.js НЕ требует OpenClaw Gateway для запуска — он стартует на любом VPS с Node 18+. Часть эндпоинтов (devices, pairing, logs, chat) вернёт ошибки пока Gateway не поднят — это нормально. Остальные (agents, SOUL, memory, status, publish-html, cover/overlay) работают независимо.
+>
+> Также admin-api вызывает несколько вспомогательных Python-скриптов (`auth-helper.py`, `manage-auth-profiles.py`, `get-auth-profiles.py`) — их в репо нет, это специфика закрытого OpenClaw. Если OAuth-флоу не нужен (например, ты используешь только Anthropic API key / OpenRouter), можешь удалить `/api/auth/*` эндпоинты из `admin-api.js` или просто не вызывать их из UI.
 
 ### Часть G. OpenClaw Gateway (11 агентов)
 

@@ -1,0 +1,503 @@
+// admin-api.js — Admin REST API for Paperclip + OpenClaw stack
+//
+// What it does:
+//   Thin Node.js HTTP server that acts as a bridge between the Paperclip UI
+//   and system-level operations on the VPS:
+//     - Manage OpenClaw agents (SOUL.md, memory, configs, models)
+//     - Proxy OAuth callbacks into the gateway Docker container
+//     - Publish HTML reports to Google Cloud Storage
+//     - Create/manage subdomains and clone sites
+//     - Delegate cover-image ImageMagick overlay to cover-overlay.js
+//
+// How to run:
+//   1. Copy .env.example to .env and fill values
+//   2. node -r dotenv/config admin-api.js
+//      (or via PM2: pm2 start admin-api.js --name admin-api)
+//
+// Node version: 18+ (for native fetch in cover-overlay.js)
+//
+// Authentication: Bearer token via Authorization header OR ?token= query param.
+//
+// IMPORTANT: This file is a TEMPLATE. Rename to admin-api.js, set env vars,
+// and adapt endpoint paths to match your own gateway container and data layout.
+
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const { execSync, exec } = require("child_process");
+
+// === Configuration via environment ===
+const PORT               = parseInt(process.env.ADMIN_API_PORT || "18791", 10);
+const TOKEN              = process.env.ADMIN_API_TOKEN;
+const PROJECT_ROOT       = process.env.PROJECT_ROOT       || "/root/openclaw";
+const WORKSPACES         = process.env.WORKSPACES_DIR     || path.join(PROJECT_ROOT, "data/openclaw/workspaces");
+const CONFIG_PATH        = process.env.OPENCLAW_CONFIG    || path.join(PROJECT_ROOT, "data/openclaw/openclaw.json");
+const AGENTS_DATA_DIR    = process.env.AGENTS_DATA_DIR    || path.join(PROJECT_ROOT, "data/openclaw/agents");
+const TOOLS_DIR          = process.env.TOOLS_DIR          || path.join(PROJECT_ROOT, "tools");
+const GATEWAY_COMPOSE    = process.env.GATEWAY_COMPOSE    || path.join(PROJECT_ROOT, "docker-compose.yml");
+const GATEWAY_CONTAINER  = process.env.GATEWAY_CONTAINER  || "openclaw-gateway";
+const GATEWAY_HEALTH_URL = process.env.GATEWAY_HEALTH_URL || "http://127.0.0.1:18789/healthz";
+const OAUTH_DAEMON_URL   = process.env.OAUTH_DAEMON_URL   || "http://localhost:1455";
+const WWW_ROOT           = process.env.WWW_ROOT           || "/var/www";
+const DOMAIN             = process.env.DOMAIN             || "example.com";
+const DEFAULT_AGENT      = process.env.DEFAULT_AGENT      || "main";
+
+// GCS settings (for /api/publish-html). Uses GCS Node SDK installed globally.
+const GCS_KEY_FILE       = process.env.GCS_KEY_FILE       || path.join(PROJECT_ROOT, "data/openclaw/gcs-key.json");
+const GCS_BUCKET         = process.env.GCS_BUCKET         || "";
+const GCS_PREFIX_DEFAULT = process.env.GCS_PREFIX_DEFAULT || "openclaw/admin";
+const GCS_NODE_PATH      = process.env.GCS_NODE_PATH      || path.join(PROJECT_ROOT, "data/openclaw/node_modules");
+
+if (!TOKEN) {
+  console.error("FATAL: ADMIN_API_TOKEN env var is required");
+  process.exit(1);
+}
+
+function getAgents() {
+  try {
+    return fs.readdirSync(WORKSPACES).filter(d => fs.existsSync(path.join(WORKSPACES, d, "SOUL.md")));
+  } catch (e) { return []; }
+}
+const AGENTS = getAgents();
+
+function readBody(req) {
+  return new Promise(r => { let b = ""; req.on("data", c => b += c); req.on("end", () => r(b)); });
+}
+
+function auth(req) {
+  const t = (req.headers.authorization || "").replace("Bearer ", "")
+    || new URL("http://x" + req.url).searchParams.get("token");
+  return t === TOKEN;
+}
+
+function json(res, data, code) {
+  code = code || 200;
+  res.writeHead(code, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+  res.end(JSON.stringify(data));
+}
+
+function safeExec(cmd, timeout) {
+  try { return execSync(cmd, { timeout: timeout || 10000 }).toString().trim(); }
+  catch (e) { return "ERROR: " + e.message; }
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method === "OPTIONS") {
+    res.writeHead(200, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE",
+    });
+    res.end(); return;
+  }
+  if (!auth(req)) { json(res, { error: "unauthorized" }, 401); return; }
+
+  const url = new URL("http://x" + req.url);
+  const p = url.pathname;
+
+  try {
+    // === AGENTS LIST ===
+    if (p === "/api/agents" && req.method === "GET") {
+      const agents = AGENTS.map(function (id) {
+        const soulPath = path.join(WORKSPACES, id, "SOUL.md");
+        const memDir = path.join(WORKSPACES, id, "memory");
+        const soul = fs.existsSync(soulPath) ? fs.statSync(soulPath).size : 0;
+        const memFiles = fs.existsSync(memDir) ? fs.readdirSync(memDir).filter(f => f.endsWith(".md")) : [];
+        return { id, soulSize: soul, memoryFiles: memFiles.length, memoryFileList: memFiles };
+      });
+      json(res, { agents });
+
+    // === SOUL.md read ===
+    } else if (p.match(/^\/api\/agents\/\w+\/soul$/) && req.method === "GET") {
+      const id = p.split("/")[3];
+      const content = fs.readFileSync(path.join(WORKSPACES, id, "SOUL.md"), "utf-8");
+      json(res, { id, content });
+
+    // === SOUL.md write ===
+    } else if (p.match(/^\/api\/agents\/\w+\/soul$/) && req.method === "PUT") {
+      const id = p.split("/")[3];
+      const body = JSON.parse(await readBody(req));
+      fs.writeFileSync(path.join(WORKSPACES, id, "SOUL.md"), body.content, "utf-8");
+      json(res, { ok: true, message: "SOUL.md saved" });
+
+    // === MEMORY list ===
+    } else if (p.match(/^\/api\/agents\/\w+\/memory$/) && req.method === "GET") {
+      const id = p.split("/")[3];
+      const memDir = path.join(WORKSPACES, id, "memory");
+      let files = [];
+      if (fs.existsSync(memDir)) {
+        files = fs.readdirSync(memDir).map(f => {
+          const st = fs.statSync(path.join(memDir, f));
+          return { name: f, size: st.size, modified: st.mtime };
+        });
+      }
+      json(res, { id, files });
+
+    // === MEMORY file read ===
+    } else if (p.match(/^\/api\/agents\/\w+\/memory\/.+/) && req.method === "GET") {
+      const parts = p.split("/");
+      const id = parts[3];
+      const file = parts.slice(5).join("/") || parts[4];
+      const content = fs.readFileSync(path.join(WORKSPACES, id, "memory", file), "utf-8");
+      json(res, { id, file, content });
+
+    // === STATUS ===
+    } else if (p === "/api/status" && req.method === "GET") {
+      const gateway = safeExec(`docker compose -f ${GATEWAY_COMPOSE} ps --format '{{.Name}} {{.Status}}'`, 5000);
+      const health = safeExec(`curl -sf ${GATEWAY_HEALTH_URL}`, 5000);
+      let pm2list = [];
+      try {
+        pm2list = JSON.parse(execSync("pm2 jlist", { timeout: 5000 }).toString()).map(pp => ({
+          name: pp.name, status: pp.pm2_env.status, uptime: pp.pm2_env.pm_uptime, memory: pp.monit ? pp.monit.memory : 0,
+        }));
+      } catch (e) {}
+      const ip = safeExec(`docker exec ${GATEWAY_CONTAINER} curl -s https://api.ipify.org`, 10000);
+      json(res, { gateway, health, pm2: pm2list, proxyIP: ip });
+
+    // === DEVICES ===
+    } else if (p === "/api/devices" && req.method === "GET") {
+      json(res, { output: safeExec(`docker exec ${GATEWAY_CONTAINER} openclaw devices list 2>&1`, 10000) });
+
+    } else if (p === "/api/devices/approve" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      json(res, { ok: true, output: safeExec(`docker exec ${GATEWAY_CONTAINER} openclaw devices approve ${body.requestId} 2>&1`, 10000) });
+
+    // === PAIRING ===
+    } else if (p === "/api/pairing/approve" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      json(res, { ok: true, output: safeExec(`docker exec ${GATEWAY_CONTAINER} openclaw pairing approve telegram ${body.code} 2>&1`, 10000) });
+
+    // === RESTART ===
+    } else if (p === "/api/restart" && req.method === "POST") {
+      exec(`cd ${PROJECT_ROOT} && docker compose restart ${GATEWAY_CONTAINER}`, { timeout: 120000 });
+      json(res, { ok: true, message: "Gateway restarting..." });
+
+    // === LOGS ===
+    } else if (p === "/api/logs" && req.method === "GET") {
+      const lines = url.searchParams.get("lines") || "30";
+      json(res, { logs: safeExec(`docker compose -f ${GATEWAY_COMPOSE} logs --tail ${lines} ${GATEWAY_CONTAINER} 2>&1`, 10000) });
+
+    // === SUBDOMAINS LIST ===
+    } else if (p === "/api/subdomains" && req.method === "GET") {
+      const suffix = "." + DOMAIN;
+      const dirs = fs.readdirSync(WWW_ROOT)
+        .filter(d => d.endsWith(suffix) && fs.statSync(path.join(WWW_ROOT, d)).isDirectory())
+        .map(d => ({ name: d, url: `https://${d}`, files: fs.readdirSync(path.join(WWW_ROOT, d)).length }));
+      json(res, { subdomains: dirs });
+
+    // === CREATE SUBDOMAIN ===
+    } else if (p === "/api/subdomains/create" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      if (!body.subdomain || !/^[a-z0-9][a-z0-9-]*$/.test(body.subdomain)) {
+        json(res, { error: "a-z, 0-9, dash only" }, 400); return;
+      }
+      json(res, {
+        ok: true,
+        url: `https://${body.subdomain}.${DOMAIN}`,
+        output: safeExec(`${TOOLS_DIR}/create-subdomain.sh ${body.subdomain}`, 30000),
+      });
+
+    // === CLONE SITE ===
+    } else if (p === "/api/clone" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      if (!body.url) { json(res, { error: "URL required" }, 400); return; }
+      const sub = body.subdomain || "";
+      exec(`${TOOLS_DIR}/clone-site.sh "${body.url}" ${sub}`, { timeout: 300000 }, function (err, stdout) {
+        const rf = `/tmp/clone-result-${(sub || "last").replace(/[^a-z0-9-]/g, "")}.json`;
+        fs.writeFileSync(rf, JSON.stringify({
+          ok: !err && stdout.indexOf("SUCCESS") !== -1,
+          output: stdout,
+          error: err ? err.message : null,
+        }));
+      });
+      json(res, { ok: true, status: "Clone started" });
+
+    // === CLONE STATUS ===
+    } else if (p === "/api/clone/status" && req.method === "GET") {
+      const sub = url.searchParams.get("subdomain") || "last";
+      const rf = `/tmp/clone-result-${sub.replace(/[^a-z0-9-]/g, "")}.json`;
+      if (fs.existsSync(rf)) { json(res, JSON.parse(fs.readFileSync(rf, "utf-8"))); }
+      else { json(res, { ok: false, status: "in_progress" }); }
+
+    // === CONFIG READ ===
+    } else if (p === "/api/config" && req.method === "GET") {
+      json(res, { content: fs.readFileSync(CONFIG_PATH, "utf-8") });
+
+    // === CONFIG WRITE ===
+    } else if (p === "/api/config" && req.method === "PUT") {
+      const body = JSON.parse(await readBody(req));
+      try { JSON.parse(body.content); }
+      catch (e) { json(res, { error: "Invalid JSON: " + e.message }, 400); return; }
+      fs.writeFileSync(CONFIG_PATH, body.content, "utf-8");
+      json(res, { ok: true, message: "Config saved" });
+
+    // === LEGACY AUTH-PROFILES (read only) ===
+    } else if (p === "/api/auth-profiles" && req.method === "GET") {
+      const profilePath = path.join(AGENTS_DATA_DIR, DEFAULT_AGENT, "agent/auth-profiles.json");
+      if (!fs.existsSync(profilePath)) { json(res, { profiles: {} }); return; }
+      const data = JSON.parse(fs.readFileSync(profilePath, "utf-8"));
+      const profiles = {};
+      for (const k in data.profiles) {
+        const v = data.profiles[k];
+        let email = null;
+        if (v.access) {
+          try {
+            const payload = v.access.split(".")[1];
+            const decoded = JSON.parse(Buffer.from(payload + "==", "base64").toString());
+            email = decoded["https://api.openai.com/profile"] ? decoded["https://api.openai.com/profile"].email : null;
+          } catch (e) {}
+        }
+        profiles[k] = {
+          provider: v.provider || v.type,
+          email,
+          expires: v.expires ? new Date(v.expires).toISOString() : null,
+          hasToken: !!(v.token || v.access),
+        };
+      }
+      json(res, { profiles });
+
+    // === PUBLISH HTML (to GCS) ===
+    } else if (p === "/api/publish-html" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      if (!body.html) { json(res, { error: "HTML required" }, 400); return; }
+      if (!GCS_BUCKET) { json(res, { error: "GCS_BUCKET not configured" }, 500); return; }
+      const fname = body.filename || `report-${Date.now()}.html`;
+      const pfx = body.prefix || GCS_PREFIX_DEFAULT;
+      const tmpFile = `/tmp/publish-${Date.now()}.html`;
+      fs.writeFileSync(tmpFile, body.html, "utf-8");
+      const gcsScript = `const{Storage}=require("@google-cloud/storage");new Storage({keyFilename:"${GCS_KEY_FILE}"}).bucket("${GCS_BUCKET}").upload("${tmpFile}",{destination:"${pfx}/${fname}",contentType:"text/html; charset=utf-8"}).then(()=>{console.log("https://storage.googleapis.com/${GCS_BUCKET}/${pfx}/${fname}");process.exit(0);})`;
+      try {
+        const gcsUrl = execSync(`NODE_PATH=${GCS_NODE_PATH} node -e '${gcsScript}'`, { timeout: 15000 }).toString().trim();
+        try { fs.unlinkSync(tmpFile); } catch (e) {}
+        json(res, { ok: true, url: gcsUrl });
+      } catch (e) { json(res, { error: e.message }, 500); }
+
+    // === SUBDOMAIN FILES (list / read / write) ===
+    } else if (p.match(/^\/api\/subdomains\/[^/]+\/files$/) && req.method === "GET") {
+      const sub = p.split("/")[3];
+      const dir = path.join(WWW_ROOT, sub);
+      if (!fs.existsSync(dir)) { json(res, { error: "Not found" }, 404); return; }
+      const files = [];
+      const walk = function (d, rel) {
+        rel = rel || "";
+        fs.readdirSync(d).forEach(function (f) {
+          const fp = path.join(d, f);
+          const rp = rel ? rel + "/" + f : f;
+          if (fs.statSync(fp).isDirectory()) { walk(fp, rp); }
+          else { files.push({ name: rp, size: fs.statSync(fp).size }); }
+        });
+      };
+      walk(dir);
+      json(res, { subdomain: sub, files });
+
+    } else if (p.match(/^\/api\/subdomains\/[^/]+\/file$/) && req.method === "GET") {
+      const sub = p.split("/")[3];
+      const filePath = url.searchParams.get("path");
+      const fp = path.join(WWW_ROOT, sub, filePath);
+      if (!fs.existsSync(fp)) { json(res, { error: "Not found" }, 404); return; }
+      json(res, { content: fs.readFileSync(fp, "utf-8"), path: filePath });
+
+    } else if (p.match(/^\/api\/subdomains\/[^/]+\/file$/) && req.method === "PUT") {
+      const sub = p.split("/")[3];
+      const body = JSON.parse(await readBody(req));
+      const fp = path.join(WWW_ROOT, sub, body.filePath);
+      const dir = path.dirname(fp);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(fp, body.content, "utf-8");
+      json(res, { ok: true, message: body.filePath + " saved" });
+
+    // === CHAT (one-shot agent message) ===
+    } else if (p === "/api/chat" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      if (!body.message) { json(res, { error: "Message required" }, 400); return; }
+      const agent = body.agentId || DEFAULT_AGENT;
+      const msg = body.message.replace(/"/g, '\\"').replace(/\n/g, " ");
+      const out = safeExec(`docker exec ${GATEWAY_CONTAINER} openclaw agent --agent-id ${agent} --message "${msg}" 2>&1`, 120000);
+      json(res, { ok: true, response: out });
+
+    // === TELEGRAM STATS ===
+    } else if (p === "/api/telegram-stats" && req.method === "GET") {
+      json(res, { output: safeExec(`docker exec ${GATEWAY_CONTAINER} openclaw sessions list 2>&1`, 10000) });
+
+    // === OAUTH START (spawns auth-helper.py daemon) ===
+    } else if (p === "/api/auth/start" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      const provider = body.provider || "openai-codex";
+      const { execFile } = require("child_process");
+      try {
+        const result = await new Promise((resolve, reject) => {
+          execFile("python3", [path.join(TOOLS_DIR, "auth-helper.py"), "start", provider], { timeout: 5000 }, (err, stdout) => {
+            if (err) reject(err); else resolve(stdout);
+          });
+        });
+        json(res, JSON.parse(result));
+      } catch (e) { json(res, { error: e.message }, 500); }
+
+    // === OAUTH STATUS ===
+    } else if (p.startsWith("/api/auth/status/") && req.method === "GET") {
+      const sid = p.split("/").pop();
+      const { execFileSync } = require("child_process");
+      try {
+        const out = execFileSync("python3", [path.join(TOOLS_DIR, "auth-helper.py"), "status", sid], { timeout: 3000 }).toString();
+        json(res, JSON.parse(out));
+      } catch (e) { json(res, { error: e.message }, 500); }
+
+    // === OAUTH PROFILES LIST ===
+    } else if (p === "/api/auth/profiles" && req.method === "GET") {
+      const { execFileSync } = require("child_process");
+      try {
+        const out = execFileSync("python3", [path.join(TOOLS_DIR, "get-auth-profiles.py")], { timeout: 5000 }).toString();
+        json(res, JSON.parse(out));
+      } catch (e) { json(res, { error: e.message }, 500); }
+
+    // === OPENCLAW AGENTS LIST (with profiles) ===
+    } else if (p === "/api/openclaw/agents" && req.method === "GET") {
+      try {
+        const ocData = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+        const agentsList = (ocData.agents || {}).list || [];
+        const defaultModel = (ocData.agents || {}).defaults || {};
+        const result = agentsList.map(function (a) {
+          const profilesPath = path.join(AGENTS_DATA_DIR, a.id, "agent/auth-profiles.json");
+          const profiles = {};
+          try {
+            const pData = JSON.parse(fs.readFileSync(profilesPath, "utf-8"));
+            const rawProfiles = pData.profiles || {};
+            for (const pk in rawProfiles) {
+              const pv = rawProfiles[pk];
+              const expiresAt = pv.expires ? new Date(pv.expires) : null;
+              const now = new Date();
+              let pstatus = "active";
+              if (expiresAt) {
+                if (expiresAt < now) pstatus = "expired";
+              } else if (!pv.token && !pv.access && !pv.apiKey) {
+                pstatus = "pending";
+              }
+              profiles[pk] = { provider: pv.provider || pv.type || "unknown", status: pstatus, expiresAt: pv.expires || null };
+            }
+          } catch (e2) {}
+          return {
+            id: a.id,
+            name: a.name,
+            emoji: (a.identity || {}).emoji || "",
+            model: a.model || defaultModel.model || {},
+            isDefault: !a.model,
+            telegram: (a.channels || {}).telegram || null,
+            profiles,
+          };
+        });
+        json(res, { agents: result, defaults: defaultModel });
+      } catch (e) { json(res, { error: e.message }, 500); }
+
+    // === OPENCLAW AGENT CONFIG UPDATE ===
+    } else if (p === "/api/openclaw/agent-config" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      if (!body.agentId) { json(res, { error: "agentId required" }, 400); return; }
+      try {
+        const ocData = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+        const agents = (ocData.agents || {}).list || [];
+        const idx = agents.findIndex(a => a.id === body.agentId);
+        if (idx === -1) { json(res, { error: "Agent not found: " + body.agentId }, 404); return; }
+        if (body.model) agents[idx].model = body.model;
+        if (body.name) agents[idx].name = body.name;
+        if (body.emoji) {
+          if (!agents[idx].identity) agents[idx].identity = {};
+          agents[idx].identity.emoji = body.emoji;
+        }
+        if (body.removeModel) delete agents[idx].model;
+        ocData.agents.list = agents;
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(ocData, null, 2), "utf-8");
+        json(res, { ok: true, agent: agents[idx] });
+      } catch (e) { json(res, { error: e.message }, 500); }
+
+    // === AUTH CALLBACK FORWARD (proxies OAuth callback into gateway container) ===
+    } else if (p === "/api/auth/callback-forward" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      if (!body.callbackUrl) { json(res, { error: "callbackUrl required" }, 400); return; }
+      try {
+        const callbackPath = body.callbackUrl.replace(/^https?:\/\/[^/]+/, "");
+        const out = execSync(
+          `docker exec ${GATEWAY_CONTAINER} curl -s '${OAUTH_DAEMON_URL}${callbackPath}' 2>&1 || echo CURL_FAILED`,
+          { timeout: 15000 }
+        ).toString().trim();
+        if (out.includes("CURL_FAILED") || out.includes("Connection refused") || out.includes("Couldn't connect")) {
+          json(res, { ok: false, error: "OAuth daemon not running. Click Re-auth and start OAuth first." });
+        } else {
+          json(res, { ok: true, message: "Callback forwarded", output: out.substring(0, 200) });
+        }
+      } catch (e) { json(res, { error: e.message }, 500); }
+
+    // === OPENCLAW AGENT PROFILE ASSIGN ===
+    } else if (p === "/api/openclaw/agent-profile-assign" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      if (!body.agentId || !body.profileKey) { json(res, { error: "agentId and profileKey required" }, 400); return; }
+      try {
+        const targetProfilesPath = path.join(AGENTS_DATA_DIR, body.agentId, "agent/auth-profiles.json");
+        let profileData = body.profileData;
+        if (!profileData) {
+          const agentDirs = fs.existsSync(AGENTS_DATA_DIR) ? fs.readdirSync(AGENTS_DATA_DIR) : [];
+          for (const dir of agentDirs) {
+            const agPath = path.join(AGENTS_DATA_DIR, dir, "agent/auth-profiles.json");
+            if (fs.existsSync(agPath)) {
+              try {
+                const agData = JSON.parse(fs.readFileSync(agPath, "utf-8"));
+                if (agData.profiles && agData.profiles[body.profileKey]) {
+                  profileData = agData.profiles[body.profileKey];
+                  break;
+                }
+              } catch (e2) {}
+            }
+          }
+        }
+        if (!profileData) { json(res, { error: "Profile not found: " + body.profileKey }, 404); return; }
+        let targetData = { profiles: {} };
+        if (fs.existsSync(targetProfilesPath)) {
+          try { targetData = JSON.parse(fs.readFileSync(targetProfilesPath, "utf-8")); } catch (e2) {}
+        }
+        if (!targetData.profiles) targetData.profiles = {};
+        targetData.profiles[body.profileKey] = profileData;
+        const assignProvider = profileData.provider || profileData.type || body.profileKey.split(":")[0];
+        const defaultKey = assignProvider + ":default";
+        targetData.profiles[defaultKey] = profileData;
+        const targetDir = path.dirname(targetProfilesPath);
+        if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+        fs.writeFileSync(targetProfilesPath, JSON.stringify(targetData, null, 2), "utf-8");
+        json(res, { ok: true, agentId: body.agentId, profileKey: body.profileKey, defaultKey });
+      } catch (e) { json(res, { error: e.message }, 500); }
+
+    // === AUTH PROFILE SET (write into all agents via manage-auth-profiles.py) ===
+    } else if (p === "/api/auth/set-profile" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      if (!body.profileKey || !body.profileData) { json(res, { error: "profileKey and profileData required" }, 400); return; }
+      const { execFileSync } = require("child_process");
+      try {
+        const out = execFileSync("python3",
+          [path.join(TOOLS_DIR, "manage-auth-profiles.py"), "set", body.profileKey, JSON.stringify(body.profileData)],
+          { timeout: 10000 }).toString();
+        json(res, JSON.parse(out));
+      } catch (e) { json(res, { error: e.message }, 500); }
+
+    // === AUTH PROFILE DELETE ===
+    } else if (p === "/api/auth/delete-profile" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      if (!body.profileKey) { json(res, { error: "profileKey required" }, 400); return; }
+      const { execFileSync } = require("child_process");
+      try {
+        const out = execFileSync("python3",
+          [path.join(TOOLS_DIR, "manage-auth-profiles.py"), "delete", body.profileKey],
+          { timeout: 10000 }).toString();
+        json(res, JSON.parse(out));
+      } catch (e) { json(res, { error: e.message }, 500); }
+
+    // === COVER OVERLAY (ImageMagick + optional GCS) ===
+    } else if (p === "/api/cover/overlay" && req.method === "POST") {
+      return require("./cover-overlay")(req, res, readBody, json);
+
+    } else {
+      json(res, { error: "not found" }, 404);
+    }
+  } catch (e) {
+    json(res, { error: e.message }, 500);
+  }
+});
+
+server.listen(PORT, "127.0.0.1", () => console.log(`Admin API listening on 127.0.0.1:${PORT}`));
